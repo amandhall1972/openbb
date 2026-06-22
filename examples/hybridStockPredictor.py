@@ -84,8 +84,9 @@ class HybridStockPredictor:
 
     def generate_synthetic_sentiment_stream(self, index: pd.DatetimeIndex) -> pd.DataFrame:
         """
-        Generates simulated daily aggregated Twitter/social sentiment data
-        bounded mathematically between -1 (strongly bearish) and +1 (strongly bullish).
+        Placeholder sentiment feed: pure random noise (not derived from any real
+        social/news data), bounded between -1 (bearish) and +1 (bullish). Swap in
+        a real sentiment source before using this signal for actual trading decisions.
         """
         np.random.seed(42)
         # Generate raw daily scores with a slight positive structural bias matching modern tech equities
@@ -108,9 +109,13 @@ class HybridStockPredictor:
         # Formulate directional target paradigm based on next-day Close price movement
         # Define: Buy (1) if Return > 0.5%, Sell (-1) if Return < -0.5%, Else Hold (0)
         next_day_return = merged_df['Close'].shift(-1) / merged_df['Close'] - 1
-        merged_df['Target'] = np.where(next_day_return > 0.005, 1, np.where(next_day_return < -0.005, -1, 0))
+        merged_df['Target'] = np.select(
+            [next_day_return > 0.005, next_day_return < -0.005], [1, -1], default=0
+        ).astype(float)
+        # The final row's forward return is undefined; mark it NaN so dropna() removes
+        # it instead of silently labeling it HOLD.
+        merged_df.loc[next_day_return.isna(), 'Target'] = np.nan
 
-        # Discard final row because its forward prediction target is undefined
         return merged_df.dropna()
 
     def train_engine(self, df: pd.DataFrame) -> dict:
@@ -125,7 +130,10 @@ class HybridStockPredictor:
         X = df[self.feature_columns]
         y = df['Target']
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+        # shuffle=False keeps the split chronological (train on earlier bars, test on
+        # later ones) to avoid look-ahead bias; a shuffled split would leak future
+        # price action into training.
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_test_scaled = self.scaler.transform(X_test)
@@ -146,13 +154,18 @@ class HybridStockPredictor:
         probabilities = self.model.predict_proba(scaled_input)[0]
 
         signal_mapping = {1: "BUY", 0: "HOLD", -1: "SELL"}
+        # Map by self.model.classes_ rather than a fixed [-1, 0, 1] position: if a class
+        # was absent from the training labels, RandomForest omits it from classes_ and
+        # predict_proba's column order shifts accordingly.
+        class_probabilities = dict(zip(self.model.classes_, probabilities))
+
         return {
             "Timestamp": input_data.index[0].strftime("%Y-%m-%d"),
-            "Signal": signal_mapping[prediction_code],
+            "Signal": signal_mapping[int(prediction_code)],
             "Confidence_Metrics": {
-                "Sell_Prob": round(probabilities[0], 4),
-                "Hold_Prob": round(probabilities[1], 4),
-                "Buy_Prob": round(probabilities[2], 4) if len(probabilities) > 2 else 0.0
+                "Sell_Prob": round(class_probabilities.get(-1, 0.0), 4),
+                "Hold_Prob": round(class_probabilities.get(0, 0.0), 4),
+                "Buy_Prob": round(class_probabilities.get(1, 0.0), 4),
             }
         }
 
